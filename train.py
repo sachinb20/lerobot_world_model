@@ -4,8 +4,8 @@ import torch.optim as optim
 import warnings
 import os
 
-from world_model.dataloader import get_dataloader, get_train_val_dataloaders, compute_delta_action
-from world_model.model import ImageWorldModel
+from lerobot_world_model.dataloader import get_dataloader, get_train_val_dataloaders, compute_delta_action
+from lerobot_world_model.model import ImageWorldModel
 
 
 def suppress_warnings():
@@ -138,59 +138,75 @@ def train(
     print(f"  Total parameters: {total_params:,}")
     
     # ==========================================================================
-    # Compute normalization statistics from the dataset
+    # Load normalization statistics (pre-computed or compute on-the-fly)
     # ==========================================================================
-    print(f"\n{'='*60}")
-    print("Computing normalization statistics...")
-    print(f"{'='*60}")
+    stats_path = os.path.join(os.path.dirname(__file__), "normalization_stats.pt")
     
-    all_states = []
-    all_delta_actions = []
-    
-    # Compute stats from training set only
-    for batch in train_loader:
-        states = batch["observation.state"]
-        curr_state = states[:, 0, :] if states.ndim == 3 else states
-        all_states.append(curr_state)
+    if os.path.exists(stats_path):
+        print(f"\n{'='*60}")
+        print("Loading pre-computed normalization statistics...")
+        print(f"{'='*60}")
         
-        if use_delta_action:
-            delta_action = compute_delta_action(batch, config)
-        else:
-            actions = batch["action"]
-            delta_action = actions[:, 0, :] if actions.ndim == 3 else actions
-        all_delta_actions.append(delta_action)
+        from lerobot_world_model.compute_stats import load_stats
+        normalization_stats = load_stats(stats_path)
+        
+        state_mean = normalization_stats['state_mean'].to(DEVICE)
+        state_std = normalization_stats['state_std'].to(DEVICE)
+        action_mean = normalization_stats['action_mean'].to(DEVICE)
+        action_std = normalization_stats['action_std'].to(DEVICE)
+        
+        print(f"  State mean: {state_mean}")
+        print(f"  State std: {state_std}")
+        print(f"  Action mean: {action_mean}")
+        print(f"  Action std: {action_std}")
+    else:
+        print(f"\n{'='*60}")
+        print("Stats file not found. Sampling to compute stats...")
+        print(f"(Run `python -m lerobot_world_model.compute_stats` for full dataset stats)")
+        print(f"{'='*60}")
+        
+        all_states = []
+        all_delta_actions = []
+        
+        max_samples = 100
+        for i, batch in enumerate(train_loader):
+            if i >= max_samples:
+                break
+            states = batch["observation.state"]
+            curr_state = states[:, 0, :] if states.ndim == 3 else states
+            all_states.append(curr_state)
+            
+            if use_delta_action:
+                delta_action = compute_delta_action(batch, config)
+            else:
+                actions = batch["action"]
+                delta_action = actions[:, 0, :] if actions.ndim == 3 else actions
+            all_delta_actions.append(delta_action)
+        
+        print(f"  Sampled {min(max_samples, len(train_loader))} batches")
+        
+        all_states = torch.cat(all_states, dim=0)
+        all_delta_actions = torch.cat(all_delta_actions, dim=0)
+        
+        state_mean = all_states.mean(dim=0).to(DEVICE)
+        state_std = (all_states.std(dim=0) + 1e-8).to(DEVICE)
+        action_mean = all_delta_actions.mean(dim=0).to(DEVICE)
+        action_std = (all_delta_actions.std(dim=0) + 1e-8).to(DEVICE)
+        
+        normalization_stats = {
+            'state_mean': state_mean.cpu(),
+            'state_std': state_std.cpu(),
+            'action_mean': action_mean.cpu(),
+            'action_std': action_std.cpu(),
+            'image_scale': 255.0,
+        }
+        
+        print(f"  State mean: {state_mean}")
+        print(f"  State std: {state_std}")
+        print(f"  Action mean: {action_mean}")
+        print(f"  Action std: {action_std}")
     
-    all_states = torch.cat(all_states, dim=0)
-    all_delta_actions = torch.cat(all_delta_actions, dim=0)
-    
-    # Compute mean and std
-    state_mean = all_states.mean(dim=0)
-    state_std = all_states.std(dim=0) + 1e-8  # Add epsilon to avoid division by zero
-    
-    action_mean = all_delta_actions.mean(dim=0)
-    action_std = all_delta_actions.std(dim=0) + 1e-8
-    
-    print(f"  State mean: {state_mean}")
-    print(f"  State std: {state_std}")
-    print(f"  Action mean: {action_mean}")
-    print(f"  Action std: {action_std}")
-    
-    # Move stats to device
-    state_mean = state_mean.to(DEVICE)
-    state_std = state_std.to(DEVICE)
-    action_mean = action_mean.to(DEVICE)
-    action_std = action_std.to(DEVICE)
-    
-    # Normalization stats dict (for saving)
-    normalization_stats = {
-        'state_mean': state_mean.cpu(),
-        'state_std': state_std.cpu(),
-        'action_mean': action_mean.cpu(),
-        'action_std': action_std.cpu(),
-        'image_scale': 255.0,  # Images normalized by dividing by 255
-    }
-    
-    print("Normalization statistics computed!")
+    print("Normalization statistics ready!")
     
     # ==========================================================================
     # Training loop
@@ -293,10 +309,39 @@ def train(
         
         avg_val_loss = total_val_loss / len(val_loader)
         
-        # Update best validation loss
+        # Save checkpoint after every epoch
+        checkpoint_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss': avg_train_loss,
+            'val_loss': avg_val_loss,
+            'best_val_loss': best_val_loss,
+            'image_size': image_size,
+            'state_dim': state_dim,
+            'action_dim': action_dim,
+            'latent_dim': latent_dim,
+            'hidden_dim': hidden_dim,
+            'in_channels': C,
+            'frame_skip': frame_skip,
+            'use_delta_action': use_delta_action,
+            'config': config,
+            'normalization_stats': normalization_stats,
+        }
+        
+        # Save latest checkpoint
+        latest_path = os.path.join(checkpoint_dir, "latest_checkpoint.pth")
+        torch.save(checkpoint, latest_path)
+        
+        # Update best validation loss and save best checkpoint
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f} | NEW BEST!")
+            best_path = os.path.join(checkpoint_dir, "best_checkpoint.pth")
+            torch.save(checkpoint, best_path)
+            print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f} | NEW BEST! ✓")
         else:
             print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
         
