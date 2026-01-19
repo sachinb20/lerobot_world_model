@@ -30,7 +30,7 @@ def suppress_warnings():
 
 
 def train(
-    batch_size=1,
+    batch_size=16,
     lr=1e-4,
     epochs=10,
     latent_dim=256,
@@ -256,7 +256,7 @@ def train(
             total_train_loss += loss.item()
             
             if i % 10 == 0:
-                print(f"Epoch {epoch} | Train Step {i} | Loss: {loss.item():.6f}")
+                print(f"Epoch {epoch} | Step {i}/{len(train_loader)} | Train Loss: {loss.item():.6f} | Last Val Loss: {best_val_loss:.6f}")
                 
         avg_train_loss = total_train_loss / len(train_loader)
         
